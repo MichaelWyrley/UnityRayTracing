@@ -1,0 +1,416 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+static const float PI = 3.1415;
+static const float EPSILON = 0.0000006;
+static const float DELTA = 0.003;
+static const int INF = 2147483647;
+
+float3 _CamPlane;
+int _Frames;
+float2 _ScreenParams;
+float4x4 _CamToWorldMatrix;
+int _maxBounceCount;
+int _numRaysPerPixel;
+float _focusDistance;
+float _defocusStrength;
+float _divergeStrength;
+
+// Environment Settings
+int _Debug;
+int _environmentEnabled;
+float3 _groundColour;
+float3 _skyColourHorizon;
+float3 _skyColourZenith;
+float _sunFocus;
+float _sunIntensity;
+float3 _sunPos;
+float _ambient;
+
+
+struct ShapeData {
+    float4 colour;
+    float emission;
+    float transmitance;
+    float smoothness;
+    float4 specularColour;
+    int triangle_begin;
+    int triangle_count;
+    float3 bounds_min;
+    float3 bounds_max;
+};
+
+struct Triangles
+{
+	float3 posA;
+	float3 posB;
+	float3 posC;
+
+	float3 normalA;
+	float3 normalB;
+	float3 normalC;
+};
+
+
+struct Collision
+{
+    bool collided;
+    float dist;
+    float3 pos;
+    float3 normal;
+    ShapeData colision_material;
+};
+
+Collision NoHit()
+{
+    Collision c;
+    c.collided = false;
+    return c;
+}
+
+struct Ray
+{
+    float3 origin;
+    float3 dir;
+
+    float transmitance;
+};
+
+
+RWStructuredBuffer<ShapeData> shapes;
+RWStructuredBuffer<Triangles> triangles;
+
+int _noShapes;
+int _noTriangles;
+
+// RNG stuff
+
+// PCG (permuted congruential generator). Thanks to:
+// www.pcg-random.org and www.shadertoy.com/view/XlGcRh
+uint NextRandom(inout uint state)
+{
+    // Weyl sequence step (golden ratio 2^32 * φ)
+    state += 0x9E3779B9u;
+
+    // Mix (MurmurHash3 finalizer / splitmix32-style)
+    uint z = state;
+    z ^= z >> 16;
+    z *= 0x85EBCA6Bu;
+    z ^= z >> 13;
+    z *= 0xC2B2AE35u;
+    z ^= z >> 16;
+    return z;
+}
+
+inline float RandomValue(inout uint state)
+{
+    uint r  = NextRandom(state);
+    uint ui = 0x3f800000u | ((r >> 9) | 1u); // force mantissa != 0
+    return asfloat(ui) - 1.0f;               // => (0, 1)
+}
+
+inline uint Hash(uint v) {
+    v ^= v >> 16; v *= 0x7feb352du;
+    v ^= v >> 15; v *= 0x846ca68bu;
+    v ^= v >> 16; return v;
+}
+inline uint Hash3(uint2 p, uint f) {
+    return Hash(p.x ^ (p.y * 0x9e3779b9u) ^ (f * 0x85ebca6bu));
+}
+
+inline void BuildONB(float3 N, out float3 T, out float3 B) {
+    float3 n = normalize(N);
+    float3 up = (abs(n.z) < 0.999f) ? float3(0,0,1) : float3(0,1,0);
+    T = normalize(cross(up, n));
+    B = cross(n, T);
+}
+
+float3 CosineHemisphere(float3 N, inout uint rngState)
+{
+    float u1 = RandomValue(rngState);
+    float u2 = RandomValue(rngState);
+    float r   = sqrt(u1);
+    float phi = 6.28318530718f * u2;
+    float x = r * cos(phi), y = r * sin(phi), z = sqrt(saturate(1.0f - u1));
+    float3 T, B; BuildONB(N, T, B);
+    return normalize(x*T + y*B + z*normalize(N));
+}
+
+float2 RandomPointInCircle(inout uint rngState)
+{
+    float angle = RandomValue(rngState) * 2 * PI;
+    float2 pointOnCircle = float2(cos(angle), sin(angle));
+    return pointOnCircle * sqrt(RandomValue(rngState));
+}
+
+// Ray Intersection Code
+
+// Thanks to https://gist.github.com/DomNomNom/46bb1ce47f68d255fd5d
+// look at https://www.scratchapixel.com/lessons/3d-basic-rendering/minimal-ray-tracer-rendering-simple-shapes/ray-box-intersection.html for more info
+bool RayBoundingBox(Ray ray, float3 boxMin, float3 boxMax)
+{
+    float3 invDir = 1 / (ray.dir);
+    float3 tMin = (boxMin - ray.origin) * invDir;
+    float3 tMax = (boxMax - ray.origin) * invDir;
+    float3 t1 = min(tMin, tMax);
+    float3 t2 = max(tMin, tMax);
+    float tNear = max(max(t1.x, t1.y), t1.z);
+    float tFar = min(min(t2.x, t2.y), t2.z);
+    return (tNear <= tFar) && (tFar >= 0.0);
+};
+
+Collision RayTriangleIntersect(Ray ray, Triangles tr){
+    float3 AB = tr.posB - tr.posA;
+    float3 AC = tr.posC - tr.posA;
+
+    float3 pvec = cross(ray.dir, AC);
+    float det = dot(AB, pvec);
+
+    if (abs(det) < EPSILON) {
+        return NoHit();
+    }
+
+    float invDet = 1.0 / (det);
+
+    float3 tvec = ray.origin - tr.posA;
+    float u = dot(tvec,pvec) * invDet;
+
+    if (u < 0.0 || u > 1.0){
+        return NoHit();
+    }
+
+    float3 qvec = cross(tvec,AB);
+    float v = dot(ray.dir,qvec) * invDet;
+    float w = 1.0 - u - v;
+
+    if (v < 0 || u + v > 1.0) {
+        return NoHit();
+    }
+
+    float dist = dot(AC,qvec) * invDet;
+
+    // Reject hits behind the origin
+    if (dist <= EPSILON) {
+        return NoHit();
+    }
+
+    // After you compute u,v,w
+    float3 Ng = normalize(cross(AB, AC));        // geometric normal
+    if (dot(Ng, ray.dir) > 0) Ng = -Ng;          // face the camera ray
+
+    float3 Ns = normalize(tr.normalA * w + tr.normalB * u + tr.normalC * v);
+    if (dot(Ns, Ng) < 0) Ns = -Ns;               // keep Ns in same hemisphere as Ng
+
+    Collision c;
+
+    c.pos = ray.origin + ray.dir * dist;
+    c.normal = Ns;
+    c.dist = dist;
+    c.collided = true;
+
+    return c;
+} 
+
+
+Collision RayIntersect(Ray ray) {
+
+    float dist = INF;
+    Collision c_min;
+    c_min.collided = false;
+    
+    for (uint s = 0 ; s < shapes.Length; s++){
+
+        if (RayBoundingBox(ray, shapes[s].bounds_min, shapes[s].bounds_max)){
+            
+            for(uint i = shapes[s].triangle_begin; i < shapes[s].triangle_begin + shapes[s].triangle_count; i++){
+                Collision c = RayTriangleIntersect(ray, triangles[i]);
+                if (c.collided){
+                    c.colision_material = shapes[s];
+
+                    if (c.dist < dist){
+                        dist = c.dist;
+                        c_min = c;
+                    }
+                } 
+            }
+        }
+    }
+
+    return c_min;
+
+}
+
+// Ray Manipulation Code
+// Crude sky colour function for background light
+float3 GetEnvironmentLight(Ray ray)
+{
+    if (!_environmentEnabled) {
+        return 0;
+    }
+    
+    float skyGradientT = pow(smoothstep(0, 0.4, ray.dir.y), 0.35);
+    float groundToSkyT = smoothstep(-0.01, 0, ray.dir.y);
+    float3 skyGradient = lerp(_skyColourHorizon, _skyColourZenith, skyGradientT);
+    float sun = pow(max(0, dot(ray.dir, _sunPos.xyz)), _sunFocus) * _sunIntensity;
+    // Combine ground, sky, and sun
+    float3 composite = lerp(_groundColour, skyGradient, groundToSkyT) + sun * (groundToSkyT>=1);
+    return composite * _ambient;
+}
+
+float3 NormalToColor(float3 n)
+{
+    // Option 1: signed, preserves direction
+    return 0.5 * (normalize(n) + 1.0);
+    // Option 2: orientation-invariant (useful if winding flips)
+    // return abs(normalize(n));
+}
+
+float3 DialetricMaterial(Ray ray, float3 normal, float refractive_index, float rng) 
+{
+
+    float cos_theta = min(dot(-ray.dir, normal), 1.0);
+    float sin_theta = sqrt(1.0-cos_theta * cos_theta);
+    float ratio = ray.transmitance / refractive_index;
+
+    bool is_reflect = ratio * sin_theta > 1.0;
+
+    // Use Schlick's approximation for reflectance.
+    float r0 = (ray.transmitance - refractive_index) / (ray.transmitance + refractive_index);
+    r0 = r0*r0;
+    float schlick_approx = r0 + (1-r0)*pow((1 - cos_theta),5);
+
+    if (is_reflect || schlick_approx > rng) {
+
+        return reflect(ray.dir, normal);
+
+    } else {
+        float3 ray_perp = ratio * (ray.dir + cos_theta*normal);
+        float3 ray_par = - sqrt(abs(1-(ray_perp * ray_perp))) * normal;
+
+        return ray_perp + ray_par;
+    }
+
+
+}
+
+// Ray Tracing Code
+float3 Trace(Ray ray, inout uint rngState){
+    float3 incomingLight = 0;
+    float3 throughput = 1;
+
+    for (uint bounce = 0; bounce < _maxBounceCount; bounce ++){
+
+        Collision c = RayIntersect(ray);
+        if (_Debug){
+            return NormalToColor(c.normal);
+        }
+
+        if (c.collided){
+
+            // Next event: choose diffuse or specular
+            float rng = RandomValue(rngState);
+            bool isSpecularBounce = c.colision_material.specularColour.w >= RandomValue(rngState);
+            bool isRefractive = c.colision_material.colour.w < 1.0;
+
+            
+            
+            if (isRefractive) {
+                // bool back_face = (dot(ray.dir,c.normal) < 0);
+                // if (back_face){
+
+                //     throughput *= NormalToColor(c.normal);
+                // } 
+                throughput *= exp(-c.dist * (1-c.colision_material.colour.xyz) * c.colision_material.colour.w);
+
+                ray.origin = c.pos - c.normal * DELTA;
+                float3 dialectric_dir = normalize(DialetricMaterial(ray, c.normal, c.colision_material.transmitance, rng));
+                float3 diffuse_dir = CosineHemisphere(c.normal, rngState);
+                ray.dir = normalize(lerp(dialectric_dir, diffuse_dir, c.colision_material.smoothness));
+                ray.transmitance = c.colision_material.transmitance;
+                
+            } else {
+                // Small offset to avoid self-hits
+                ray.origin = c.pos + c.normal * DELTA;
+
+                float3 specularDir = reflect(ray.dir, c.normal);
+                float3 diffuseDir = CosineHemisphere(c.normal, rngState);
+
+                ray.dir = normalize(lerp(diffuseDir, specularDir, c.colision_material.smoothness * isSpecularBounce));
+                // Hit: add emission (if any) from the surface we struck
+                float3 emitted =  c.colision_material.colour.xyz * c.colision_material.emission;
+                incomingLight += emitted * throughput;
+                throughput *= lerp(c.colision_material.colour.xyz, c.colision_material.specularColour.xyz, isSpecularBounce);
+
+                float p = max(throughput.r, max(throughput.g, throughput.b));
+                if (rng >= p) {
+                    break;
+                }
+                throughput *= 1.0f / p; 
+            }
+
+
+
+            
+        } else {
+            incomingLight += GetEnvironmentLight(ray) * throughput;
+            // incomingLight = c.colision_material.colour * throughput;
+            return incomingLight;
+        }
+
+    }
+
+    incomingLight = max(incomingLight, _ambient * throughput);
+    return incomingLight;
+}
+
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+
+    uint width,height;
+    Result.GetDimensions(width, height);
+
+    float2 uv = id.xy / float2(width,height);
+
+    // Create seed for random number generator
+    uint pixelIndex = id.y * width + id.x;
+    uint rngState = Hash3(id.xy, (uint)_Frames);
+
+    // Ray tracing
+    Ray ray;
+    float3 totalIncomingLight = 0;
+
+    float3 focusPointLocal = float3((uv - 0.5), 1) * _CamPlane;
+    float3 focusPoint = mul(_CamToWorldMatrix, float4(focusPointLocal, 1));
+    float3 camRight = _CamToWorldMatrix._m00_m10_m20;
+    float3 camUp = _CamToWorldMatrix._m01_m11_m21;
+
+
+
+    for (uint rayIndex = 0; rayIndex < _numRaysPerPixel; rayIndex ++)
+    {	
+        rngState =  Hash3(id.xy, (uint)_Frames+ rayIndex* 0x68bc21ebu) ;
+        // Calculate ray origin and direction
+        float2 defocusJitter = RandomPointInCircle(rngState) * _defocusStrength / width;
+        ray.origin = mul(_CamToWorldMatrix, float4(0,0,0,1)).xyz + camRight * defocusJitter.x + camUp * defocusJitter.y;
+
+        float2 jitter = RandomPointInCircle(rngState) * _divergeStrength / width;
+        float3 jitteredFocusPoint = focusPoint + camRight * jitter.x + camUp * jitter.y;
+        ray.dir = normalize(jitteredFocusPoint - ray.origin);
+        ray.transmitance = 1.0f;
+
+        // ray.origin = mul(_CamToWorldMatrix, float4(0,0,0,1)).xyz;
+        // ray.dir = normalize(focusPoint - ray.origin);
+
+        // Trace
+        totalIncomingLight += Trace(ray, rngState);
+    }
+
+    float3 pixelCol = totalIncomingLight / _numRaysPerPixel;
+    Result[id.xy] = float4(pixelCol, 1);
+}
