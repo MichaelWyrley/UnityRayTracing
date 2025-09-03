@@ -10,7 +10,7 @@ A compute shader is utalised to perform all ray calculations.
 
 ![alt text](/github_assets/glass_caustic.png "Caustic Image")
 
-![alt text](/github_assets/boxes.png.png "Boxes Image")
+![alt text](/github_assets/boxes.png "Boxes Image")
 
 
 
